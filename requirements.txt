@@ -1,0 +1,5 @@
+docxtpl
+jinja2
+openpyxl
+python-docx
+xlrd
