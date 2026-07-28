@@ -1169,15 +1169,18 @@ def render_report(template_path: Path, context: dict[str, Any], output_path: Pat
     tpl = DocxTemplate(str(template_path))
     tpl.render(context)
     tpl.save(output_path)
-    merge_rank_group_cells(output_path)
+    format_report_docx(output_path, context["district_rank_rows"])
+    bold_city_town_counts(output_path)
     update_rank_chart(output_path, context["district_rank_rows"])
 
 
-def merge_rank_group_cells(path: Path) -> None:
+def format_report_docx(path: Path, rank_rows: list[dict[str, Any]]) -> None:
     doc = Document(str(path))
     if len(doc.tables) < 2:
+        doc.save(str(path))
         return
     table = doc.tables[1]
+    bold_rank_group_first_rows(table, rank_rows)
     if len(table.rows) <= 3:
         doc.save(str(path))
         return
@@ -1189,21 +1192,127 @@ def merge_rank_group_cells(path: Path) -> None:
             end = row_idx - 1
             if current and end > start:
                 merged = table.cell(start, 1).merge(table.cell(end, 1))
-                set_cell_text_style(merged, current, size_pt=11)
+                set_cell_text_style(merged, current, size_pt=11, bold=True)
             start = row_idx
             current = group
     doc.save(str(path))
 
 
-def set_cell_text_style(cell: Any, text: str, size_pt: int = 11) -> None:
+def bold_rank_group_first_rows(table: Any, rank_rows: list[dict[str, Any]]) -> None:
+    start_row = 2
+    for idx, data in enumerate(rank_rows):
+        row_idx = start_row + idx
+        if row_idx >= len(table.rows) or not data.get("group_first"):
+            continue
+        for cell in table.rows[row_idx].cells:
+            set_cell_runs_bold(cell)
+
+
+def set_cell_runs_bold(cell: Any) -> None:
+    for paragraph in cell.paragraphs:
+        for run in paragraph.runs:
+            run.bold = True
+            run.font.name = "仿宋_GB2312"
+            run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋_GB2312")
+
+
+def set_cell_text_style(cell: Any, text: str, size_pt: int = 11, bold: bool = False) -> None:
     cell.text = ""
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
     paragraph = cell.paragraphs[0]
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = paragraph.add_run(text)
+    run.bold = bold
     run.font.size = Pt(size_pt)
     run.font.name = "仿宋_GB2312"
     run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋_GB2312")
+
+
+def bold_city_town_counts(path: Path) -> None:
+    w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns = {"w": w_ns}
+    with zipfile.ZipFile(path, "r") as zin:
+        document_name = "word/document.xml"
+        if document_name not in zin.namelist():
+            return
+        document_xml = zin.read(document_name)
+    root = ET.fromstring(document_xml)
+    changed = False
+    for paragraph in root.findall(".//w:p", ns):
+        text_nodes = paragraph.findall(".//w:t", ns)
+        text = "".join(node.text or "" for node in text_nodes)
+        segments = city_town_count_segments(text)
+        if not segments:
+            continue
+        first_r_pr = None
+        for run in paragraph.findall("w:r", ns):
+            first_r_pr = run.find("w:rPr", ns)
+            if first_r_pr is not None:
+                first_r_pr = deepcopy(first_r_pr)
+                break
+        paragraph_props = paragraph.find("w:pPr", ns)
+        for child in list(paragraph):
+            if child is not paragraph_props:
+                paragraph.remove(child)
+        for segment_text, bold in segments:
+            run = ET.SubElement(paragraph, f"{{{w_ns}}}r")
+            if first_r_pr is not None:
+                r_pr = deepcopy(first_r_pr)
+            else:
+                r_pr = ET.Element(f"{{{w_ns}}}rPr")
+            if bold:
+                ensure_word_bool(r_pr, "b", w_ns)
+                ensure_word_bool(r_pr, "bCs", w_ns)
+            run.append(r_pr)
+            text_node = ET.SubElement(run, f"{{{w_ns}}}t")
+            text_node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            text_node.text = segment_text
+        changed = True
+    if changed:
+        replace_docx_part(path, "word/document.xml", ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+
+def city_town_count_segments(text: str) -> list[tuple[str, bool]]:
+    marker = "问题突出的乡镇是"
+    start = text.find(marker)
+    if start < 0:
+        return []
+    tail_start = start + len(marker)
+    end_candidates = [idx for idx in (text.find("。", tail_start), text.find("；", tail_start), text.find(";", tail_start)) if idx >= 0]
+    tail_end = min(end_candidates) if end_candidates else len(text)
+    target = text[tail_start:tail_end]
+    matches = list(re.finditer(r"[^、，,。；;]+?\d+处", target))
+    if not matches:
+        return []
+    segments: list[tuple[str, bool]] = []
+    cursor = 0
+    absolute_target_start = tail_start
+    for match in matches:
+        match_start = absolute_target_start + match.start()
+        match_end = absolute_target_start + match.end()
+        if match_start > cursor:
+            segments.append((text[cursor:match_start], False))
+        segments.append((text[match_start:match_end], True))
+        cursor = match_end
+    if cursor < len(text):
+        segments.append((text[cursor:], False))
+    return [(segment, bold) for segment, bold in segments if segment]
+
+
+def ensure_word_bool(parent: ET.Element, tag: str, w_ns: str) -> None:
+    node = parent.find(f"{{{w_ns}}}{tag}")
+    if node is None:
+        node = ET.SubElement(parent, f"{{{w_ns}}}{tag}")
+    node.set(f"{{{w_ns}}}val", "1")
+
+
+def replace_docx_part(path: Path, part_name: str, new_data: bytes) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with zipfile.ZipFile(path, "r") as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = new_data if item.filename == part_name else zin.read(item.filename)
+            zout.writestr(item, data)
+    tmp.replace(path)
 
 
 def update_rank_chart(path: Path, rank_rows: list[dict[str, Any]]) -> None:
@@ -1246,7 +1355,7 @@ def update_chart_workbook(workbook_bytes: bytes, rank_rows: list[dict[str, Any]]
         ws = wb.active
         for merged_range in list(ws.merged_cells.ranges):
             ws.unmerge_cells(str(merged_range))
-        avg = sum(float(row["issue_rate"]) for row in rank_rows) / len(rank_rows)
+        avg = rank_rows_average_issue_rate(rank_rows)
         for row_idx in range(3, 64):
             for col_idx in range(1, 14):
                 ws.cell(row_idx, col_idx).value = None
@@ -1290,16 +1399,21 @@ def update_chart_xml(chart_xml: bytes, rank_rows: list[dict[str, Any]]) -> bytes
     ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
     ET.register_namespace("c14", "http://schemas.microsoft.com/office/drawing/2007/8/2/chart")
     ET.register_namespace("c15", "http://schemas.microsoft.com/office/drawing/2012/chart")
-    ns = {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart"}
+    ns = {
+        "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    }
     root = ET.fromstring(chart_xml)
     end_row = 2 + len(rank_rows)
-    avg = sum(float(row["issue_rate"]) for row in rank_rows) / len(rank_rows)
+    avg = rank_rows_average_issue_rate(rank_rows)
     categories = [(row["group"] if row.get("group_first") else None, row["town"]) for row in rank_rows]
     rates = [float(row["issue_rate"]) for row in rank_rows]
     averages = [avg for _row in rank_rows]
     group_point_styles = chart_group_point_styles(root, ns)
     clear_chart_point_overrides(root, ns)
     apply_chart_group_colors(root, rank_rows, group_point_styles, ns)
+    emphasize_average_series(root, ns)
+    add_average_line_label(root, len(rank_rows), ns)
 
     for cat in root.findall(".//c:cat", ns):
         ref = cat.find(".//c:multiLvlStrRef", ns)
@@ -1391,11 +1505,148 @@ def clear_chart_point_overrides(root: ET.Element, ns: dict[str, str]) -> None:
             node.set("val", value)
 
 
+def add_average_line_label(root: ET.Element, point_count: int, ns: dict[str, str]) -> None:
+    if point_count <= 0:
+        return
+    average_series = None
+    for series in root.findall(".//c:ser", ns):
+        series_name = series.find(".//c:tx//c:v", ns)
+        if series_name is not None and clean_text(series_name.text) == "平均值":
+            average_series = series
+            break
+    if average_series is None:
+        series_list = root.findall(".//c:ser", ns)
+        if len(series_list) > 1:
+            average_series = series_list[1]
+    if average_series is None:
+        return
+    d_lbls = average_series.find("c:dLbls", ns)
+    if d_lbls is None:
+        d_lbls = ET.SubElement(average_series, f"{{{ns['c']}}}dLbls")
+    label = ET.Element(f"{{{ns['c']}}}dLbl")
+    idx = ET.SubElement(label, f"{{{ns['c']}}}idx")
+    idx.set("val", str(point_count - 1))
+    num_fmt = ET.SubElement(label, f"{{{ns['c']}}}numFmt")
+    num_fmt.set("formatCode", "0.00")
+    num_fmt.set("sourceLinked", "0")
+    d_lbl_pos = ET.SubElement(label, f"{{{ns['c']}}}dLblPos")
+    d_lbl_pos.set("val", "r")
+    for tag, value in {
+        "showLegendKey": "0",
+        "showVal": "1",
+        "showCatName": "0",
+        "showSerName": "0",
+        "showPercent": "0",
+        "showBubbleSize": "0",
+    }.items():
+        node = ET.SubElement(label, f"{{{ns['c']}}}{tag}")
+        node.set("val", value)
+    label.append(chart_text_props(ns, font_name="仿宋_GB2312", size_pt=10, bold=True))
+    insert_at = next(
+        (idx for idx, child in enumerate(d_lbls) if child.tag == f"{{{ns['c']}}}showLegendKey"),
+        len(d_lbls),
+    )
+    d_lbls.insert(insert_at, label)
+
+
+def emphasize_average_series(root: ET.Element, ns: dict[str, str]) -> None:
+    series_list = root.findall(".//c:lineChart/c:ser", ns)
+    if not series_list:
+        return
+    target = None
+    for series in series_list:
+        series_name = series.find(".//c:tx//c:v", ns)
+        if series_name is not None and clean_text(series_name.text) == "平均值":
+            target = series
+            break
+    if target is None:
+        target = series_list[-1]
+    sp_pr = target.find("c:spPr", ns)
+    if sp_pr is None:
+        sp_pr = ET.SubElement(target, f"{{{ns['c']}}}spPr")
+    line = sp_pr.find("a:ln", ns)
+    if line is None:
+        line = ET.SubElement(sp_pr, f"{{{ns['a']}}}ln")
+    line.set("w", "38100")
+    line.set("cap", "rnd")
+    for child in list(line):
+        if child.tag == f"{{{ns['a']}}}prstDash":
+            line.remove(child)
+    solid_fill = line.find("a:solidFill", ns)
+    if solid_fill is None:
+        solid_fill = ET.SubElement(line, f"{{{ns['a']}}}solidFill")
+    for child in list(solid_fill):
+        solid_fill.remove(child)
+    scheme = ET.SubElement(solid_fill, f"{{{ns['a']}}}schemeClr")
+    scheme.set("val", "accent2")
+    marker = target.find("c:marker", ns)
+    if marker is None:
+        marker = ET.SubElement(target, f"{{{ns['c']}}}marker")
+    symbol = marker.find("c:symbol", ns)
+    if symbol is None:
+        symbol = ET.SubElement(marker, f"{{{ns['c']}}}symbol")
+    symbol.set("val", "circle")
+    size = marker.find("c:size", ns)
+    if size is None:
+        size = ET.SubElement(marker, f"{{{ns['c']}}}size")
+    size.set("val", "7")
+
+
+def chart_text_props(ns: dict[str, str], font_name: str, size_pt: int, bold: bool = False) -> ET.Element:
+    tx_pr = ET.Element(f"{{{ns['c']}}}txPr")
+    body_pr = ET.SubElement(tx_pr, f"{{{ns['a']}}}bodyPr")
+    body_pr.set("rot", "0")
+    body_pr.set("spcFirstLastPara", "1")
+    body_pr.set("vertOverflow", "ellipsis")
+    body_pr.set("vert", "horz")
+    body_pr.set("wrap", "square")
+    body_pr.set("lIns", "38100")
+    body_pr.set("tIns", "19050")
+    body_pr.set("rIns", "38100")
+    body_pr.set("bIns", "19050")
+    body_pr.set("anchor", "ctr")
+    body_pr.set("anchorCtr", "1")
+    ET.SubElement(body_pr, f"{{{ns['a']}}}spAutoFit")
+    ET.SubElement(tx_pr, f"{{{ns['a']}}}lstStyle")
+    p = ET.SubElement(tx_pr, f"{{{ns['a']}}}p")
+    p_pr = ET.SubElement(p, f"{{{ns['a']}}}pPr")
+    def_rpr = ET.SubElement(p_pr, f"{{{ns['a']}}}defRPr")
+    def_rpr.set("lang", "zh-CN")
+    def_rpr.set("sz", str(size_pt * 100))
+    def_rpr.set("b", "1" if bold else "0")
+    def_rpr.set("i", "0")
+    def_rpr.set("u", "none")
+    def_rpr.set("strike", "noStrike")
+    def_rpr.set("kern", "1200")
+    def_rpr.set("baseline", "0")
+    ln = ET.SubElement(def_rpr, f"{{{ns['a']}}}ln")
+    ET.SubElement(ln, f"{{{ns['a']}}}noFill")
+    solid_fill = ET.SubElement(def_rpr, f"{{{ns['a']}}}solidFill")
+    scheme = ET.SubElement(solid_fill, f"{{{ns['a']}}}schemeClr")
+    scheme.set("val", "tx1")
+    latin = ET.SubElement(def_rpr, f"{{{ns['a']}}}latin")
+    latin.set("typeface", font_name)
+    east_asia = ET.SubElement(def_rpr, f"{{{ns['a']}}}ea")
+    east_asia.set("typeface", font_name)
+    cs = ET.SubElement(def_rpr, f"{{{ns['a']}}}cs")
+    cs.set("typeface", font_name)
+    ET.SubElement(p, f"{{{ns['a']}}}endParaRPr")
+    return tx_pr
+
+
+def rank_rows_average_issue_rate(rank_rows: list[dict[str, Any]]) -> float:
+    checked_total = sum(int(row["checked_count"]) for row in rank_rows)
+    issue_total = sum(int(row["issue_count"]) for row in rank_rows)
+    if checked_total <= 0:
+        return 0.0
+    return issue_total / checked_total
+
+
 def update_value_axis_scale(root: ET.Element, values: list[float], ns: dict[str, str]) -> None:
     if not values:
         return
     axis_max = nice_axis_max(max(values))
-    major_unit = nice_major_unit(axis_max)
+    major_unit = 5
     for val_ax in root.findall(".//c:valAx", ns):
         scaling = val_ax.find("c:scaling", ns)
         if scaling is None:
@@ -1417,24 +1668,7 @@ def update_value_axis_scale(root: ET.Element, values: list[float], ns: dict[str,
 def nice_axis_max(value: float) -> float:
     if value <= 0:
         return 1
-    padded = value * 1.25
-    return nice_ceiling(padded)
-
-
-def nice_major_unit(axis_max: float) -> float:
-    return nice_ceiling(axis_max / 5)
-
-
-def nice_ceiling(value: float) -> float:
-    if value <= 0:
-        return 1
-    magnitude = 10 ** int(f"{value:e}".split("e")[1])
-    normalized = value / magnitude
-    for step in (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
-        if normalized <= step:
-            result = step * magnitude
-            return round(result, 6)
-    return round(10 * magnitude, 6)
+    return float(((int(value) + 4) // 5) * 5)
 
 
 def replace_multi_level_cache(cache: ET.Element, categories: list[tuple[str | None, str]], ns: dict[str, str]) -> None:
