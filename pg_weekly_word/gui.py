@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, X, Y, Button, Entry, Frame, Label, StringVar, Text, Tk, filedialog, messagebox, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, X, Y, Button, Entry, Frame, Label, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
 
 from .core import (
+    GROUP_ORDER,
     PROJECT_ROOT,
     GROUP_CONFIG_PATH,
     WeeklyReportError,
+    add_group_point,
     city_sheet_names,
     default_city_sheet,
     generate_weekly_report,
@@ -57,6 +59,7 @@ class WeeklyReportApp:
         self._file_row(file_frame, 1, "周市级检查台账", "city", [("Excel", "*.xlsx *.xlsm"), ("所有文件", "*.*")], self._after_city_selected)
         self._file_row(file_frame, 2, "Jinja 周报模板", "template", [("Word 模板", "*.docx"), ("所有文件", "*.*")])
         self._file_row(file_frame, 3, "分组清单（可选上传）", "group", [("Excel", "*.xlsx"), ("所有文件", "*.*")])
+        Button(file_frame, text="新增点位", command=self.open_add_point_dialog).grid(row=3, column=3, padx=4, pady=3)
         self._dir_row(file_frame, 4, "输出目录", "output")
         Button(file_frame, text="自动查找", command=self.auto_fill_files).grid(row=5, column=2, padx=4, pady=3)
 
@@ -133,6 +136,46 @@ class WeeklyReportApp:
         yscroll.pack(side=RIGHT, fill=Y)
         text.pack(side=LEFT, fill=BOTH, expand=True)
         return text
+
+    def open_add_point_dialog(self) -> None:
+        dialog = Toplevel(self.root)
+        dialog.title("新增点位")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        town_var = StringVar()
+        group_var = StringVar(value=GROUP_ORDER[0] if GROUP_ORDER else "")
+
+        Label(dialog, text="城乡镇").grid(row=0, column=0, sticky=W, padx=10, pady=(10, 4))
+        town_entry = Entry(dialog, textvariable=town_var, width=28)
+        town_entry.grid(row=0, column=1, sticky=W, padx=10, pady=(10, 4))
+        Label(dialog, text="分组").grid(row=1, column=0, sticky=W, padx=10, pady=4)
+        group_combo = ttk.Combobox(dialog, textvariable=group_var, values=GROUP_ORDER, width=25)
+        group_combo.grid(row=1, column=1, sticky=W, padx=10, pady=4)
+
+        button_frame = Frame(dialog)
+        button_frame.grid(row=2, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 10))
+        Button(button_frame, text="取消", command=dialog.destroy).pack(side=LEFT, padx=(0, 6))
+        Button(button_frame, text="新增", command=lambda: self._add_group_point(dialog, town_var, group_var)).pack(side=LEFT)
+
+        town_entry.focus_set()
+        self.root.wait_window(dialog)
+
+    def _add_group_point(self, dialog: Toplevel, town_var: StringVar, group_var: StringVar) -> None:
+        town = town_var.get().strip()
+        group = group_var.get().strip()
+        try:
+            add_group_point(town, group)
+        except WeeklyReportError as exc:
+            messagebox.showerror("新增失败", str(exc), parent=dialog)
+            return
+        self.vars["status"].set(f"已新增分组点位：{town}（{group}）。")
+        note = ""
+        if self._group_path_value():
+            note = "\n\n当前界面仍选择了上传分组清单，生成时会优先使用上传文件；如需使用刚新增的后台分组，请清空分组清单上传框。"
+        messagebox.showinfo("新增成功", f"已更新后台分组表：{GROUP_CONFIG_PATH}{note}", parent=dialog)
+        dialog.destroy()
 
     def _select_file(self, key: str, filetypes: list[tuple[str, str]], callback=None) -> None:
         path = filedialog.askopenfilename(filetypes=filetypes)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -11,16 +12,42 @@ ROOT = Path(__file__).resolve().parent
 APP_NAME = "平谷周报生成工具"
 BUILD_ROOT = ROOT / "work" / "build"
 PYINSTALLER_CONFIG = BUILD_ROOT / "pyinstaller_config"
+STAGE_DIST = BUILD_ROOT / "dist"
 DIST_ROOT = ROOT / "release"
 RELEASE_DIR = DIST_ROOT / APP_NAME
+STAGE_APP_DIR = STAGE_DIST / APP_NAME
 
 
-def copy_tree(src: Path, dst: Path) -> None:
+def make_writable(path: Path) -> None:
+    try:
+        path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def remove_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    for item in path.rglob("*"):
+        make_writable(item)
+    make_writable(path)
+    shutil.rmtree(path)
+
+
+def copy_file_unlocked(src: str, dst: str) -> str:
+    shutil.copyfile(src, dst)
+    make_writable(Path(dst))
+    return dst
+
+
+def copy_tree_unlocked(src: Path, dst: Path) -> None:
     if not src.exists():
         return
     if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(src, dst)
+        remove_tree(dst)
+    shutil.copytree(src, dst, copy_function=copy_file_unlocked)
+    for item in dst.rglob("*"):
+        make_writable(item)
 
 
 def main() -> int:
@@ -50,21 +77,24 @@ def main() -> int:
         "--windowed",
         "--name",
         APP_NAME,
-        "--distpath",
-        str(DIST_ROOT),
+            "--distpath",
+            str(STAGE_DIST),
         "--workpath",
         str(BUILD_ROOT / "pyinstaller_work"),
         "--specpath",
         str(BUILD_ROOT),
         str(ROOT / "app.py"),
     ]
+    remove_tree(STAGE_APP_DIR)
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
-    copy_tree(ROOT / "docs", RELEASE_DIR / "docs")
-    copy_tree(ROOT / "input", RELEASE_DIR / "input")
+    remove_tree(RELEASE_DIR)
+    copy_tree_unlocked(STAGE_APP_DIR, RELEASE_DIR)
+    copy_tree_unlocked(ROOT / "docs", RELEASE_DIR / "docs")
+    copy_tree_unlocked(ROOT / "input", RELEASE_DIR / "input")
     (RELEASE_DIR / "output").mkdir(exist_ok=True)
     (RELEASE_DIR / "work").mkdir(exist_ok=True)
-    shutil.copy2(ROOT / "README.md", RELEASE_DIR / "README.md")
+    copy_file_unlocked(str(ROOT / "README.md"), str(RELEASE_DIR / "README.md"))
     return 0
 
 

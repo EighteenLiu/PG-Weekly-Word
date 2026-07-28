@@ -570,6 +570,19 @@ def save_groups_json(groups: dict[str, str], path: Path = GROUP_CONFIG_PATH) -> 
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def add_group_point(town: str, group: str, path: Path = GROUP_CONFIG_PATH) -> dict[str, str]:
+    town_name = clean_text(town)
+    group_name = clean_text(group)
+    if not town_name:
+        raise WeeklyReportError("请填写城乡镇。")
+    if not group_name:
+        raise WeeklyReportError("请填写分组。")
+    groups = load_groups_json(path)
+    groups[town_name] = group_name
+    save_groups_json(groups, path)
+    return groups
+
+
 def read_groups_excel(path: Path) -> dict[str, str]:
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
